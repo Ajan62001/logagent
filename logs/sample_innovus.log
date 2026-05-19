@@ -1,0 +1,32 @@
+#  Cadence Innovus(TM) Implementation System.
+#  Version 21.13-s100_1
+#  Date: Mon May 19 04:12:07 2026
+#  Host: eda-blade-07
+###############################################################################
+<CMD> source scripts/init_design.tcl
+[04:12:09  1s] Reading library /pdk/tsmc7/lib/sc9_base_ssg.lib ...
+[04:12:31  23s] **WARN: (IMPSYN-1023): Library 'sc9_base_ssg.lib' is characterized at 0.72V; design nominal is 0.75V.
+[04:12:33  25s] Reading LEF /pdk/tsmc7/lef/tech.lef ...
+[04:12:40  32s] --- Starting "init_design" ---
+[04:12:55  47s] <CMD> read_netlist netlist/top.v
+[04:13:20  72s] Loaded 1842300 cells.
+[04:13:21  73s] --- Ending "init_design" (totcpu=58.2) ---
+<CMD> source scripts/floorplan.tcl
+[04:13:22  74s] --- Starting "floorplan" ---
+[04:13:25  77s] **WARN: (IMPFP-221): Aspect ratio 0.41 is outside the recommended 0.5-2.0 band.
+[04:14:02  114s] --- Ending "floorplan" (totcpu=120.4) ---
+<CMD> source scripts/place.tcl
+[04:14:03  115s] --- Starting "place" ---
+[04:14:10  122s] **ERROR: (IMPSDC-3071): Constraint file scripts/constraints/top.sdc line 88: clock 'core_clk' referenced before it is created.
+[04:14:10  122s] **WARN: (IMPSDC-3099): 412 timing endpoints have no constraint due to the SDC error above.
+[04:15:48  220s] Placement density 0.71; legalized 1842300 instances.
+[04:15:49  221s] --- Ending "place" (totcpu=210.9) ---
+<CMD> source scripts/cts.tcl
+[04:15:50  222s] --- Starting "clock_tree_synthesis" ---
+[04:15:51  223s] **ERROR: (IMPCTS-5012): No clock definitions found; skipping CTS. Check upstream SDC errors.
+[04:15:51  223s] --- Ending "clock_tree_synthesis" (totcpu=1.1) ---
+<CMD> source scripts/route.tcl
+[04:15:52  224s] --- Starting "route" ---
+[04:16:30  262s] **ERROR: (IMPROUTE-7440): 0 clock nets routed; clock tree is empty.
+[04:17:05  297s] FATAL: (IMPCORE-9001): NanoRoute terminated abnormally — unconstrained clock topology. See scripts/route.tcl.
+[04:17:05  297s] Signal 11 caught — core dumped (/tmp/innovus_eda-blade-07_44213.core)

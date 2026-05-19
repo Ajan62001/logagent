@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "logb"
+version = "0.1.0"
+description = "Tool-using AI agent for EDA-tool log debugging & root-cause analysis"
+requires-python = ">=3.10"
+dependencies = []  # pure stdlib by design
+
+[project.scripts]
+logb = "logb.cli:main"
+
+[tool.setuptools]
+packages = ["logb", "logb.tools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
