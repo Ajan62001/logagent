@@ -55,6 +55,25 @@ def _http_json(url: str, payload: dict, headers: dict, timeout: int = 600) -> di
         raise LLMError(f"non-JSON reply from {url}: {e}") from e
 
 
+def _http_stream(url: str, payload: dict, headers: dict, timeout: int = 600):
+    """Stream the response body line-by-line (NDJSON for Ollama, SSE for
+    Anthropic). Bubbles up an LLMError on transport failure."""
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:500]
+        raise LLMError(f"HTTP {e.code} from {url}: {detail}") from e
+    except urllib.error.URLError as e:
+        raise LLMError(f"cannot reach {url}: {e.reason}") from e
+    try:
+        for raw in resp:
+            yield raw
+    finally:
+        resp.close()
+
+
 # --------------------------------------------------------------------------- #
 #  Ollama backend (default) — POST /api/chat with native tool calling.        #
 # --------------------------------------------------------------------------- #
@@ -86,17 +105,8 @@ class OllamaClient:
                 })
         return msgs
 
-    def chat(self, system: str, history: list[dict], tools: list[dict]) -> Assistant:
-        payload = {
-            "model": self.model,
-            "messages": self._messages(system, history),
-            "tools": [{"type": "function", "function": t} for t in tools],
-            "stream": False,
-            "options": {"temperature": self.temperature, "num_ctx": self.num_ctx},
-        }
-        data = _http_json(f"{self.host}/api/chat", payload,
-                          {"Content-Type": "application/json"})
-        msg = data.get("message", {})
+    @staticmethod
+    def _extract_tool_calls(msg: dict) -> list[dict]:
         calls = []
         for i, tc in enumerate(msg.get("tool_calls") or []):
             fn = tc.get("function", {})
@@ -108,7 +118,50 @@ class OllamaClient:
                     args = {}
             calls.append({"id": f"call_{i}", "name": fn.get("name", ""),
                           "args": args or {}})
-        return Assistant(text=msg.get("content", "") or "", tool_calls=calls)
+        return calls
+
+    def chat(self, system: str, history: list[dict], tools: list[dict],
+             on_token=None) -> Assistant:
+        """When `on_token` is supplied, stream text deltas to it as they
+        arrive (transforms a 30 s blank wait into live output). Tool calls
+        and the final Assistant payload are unchanged either way."""
+        payload = {
+            "model": self.model,
+            "messages": self._messages(system, history),
+            "tools": [{"type": "function", "function": t} for t in tools],
+            "stream": on_token is not None,
+            "options": {"temperature": self.temperature, "num_ctx": self.num_ctx},
+        }
+        url = f"{self.host}/api/chat"
+        headers = {"Content-Type": "application/json"}
+        if on_token is None:
+            data = _http_json(url, payload, headers)
+            msg = data.get("message", {})
+            return Assistant(text=msg.get("content", "") or "",
+                             tool_calls=self._extract_tool_calls(msg))
+
+        # Streaming: each line is a complete JSON chunk (NDJSON). Some chunks
+        # carry text deltas, the final chunk carries tool_calls + done=True.
+        text_parts: list[str] = []
+        tool_calls: list[dict] = []
+        for raw in _http_stream(url, payload, headers):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg = obj.get("message", {})
+            chunk = msg.get("content", "")
+            if chunk:
+                text_parts.append(chunk)
+                on_token(chunk)
+            if msg.get("tool_calls"):
+                tool_calls = self._extract_tool_calls(msg)
+            if obj.get("done"):
+                break
+        return Assistant(text="".join(text_parts), tool_calls=tool_calls)
 
 
 # --------------------------------------------------------------------------- #
@@ -152,7 +205,8 @@ class AnthropicClient:
                     out.append({"role": "user", "content": [blk]})
         return out
 
-    def chat(self, system: str, history: list[dict], tools: list[dict]) -> Assistant:
+    def chat(self, system: str, history: list[dict], tools: list[dict],
+             on_token=None) -> Assistant:
         payload = {
             "model": self.model,
             "max_tokens": self.max_tokens,
@@ -162,19 +216,63 @@ class AnthropicClient:
             "tools": [{"name": t["name"], "description": t["description"],
                        "input_schema": t["parameters"]} for t in tools],
         }
-        data = _http_json(self.API, payload, {
+        headers = {
             "Content-Type": "application/json",
             "x-api-key": self.key,
             "anthropic-version": "2023-06-01",
-        })
-        text, calls = "", []
-        for blk in data.get("content", []):
-            if blk.get("type") == "text":
-                text += blk.get("text", "")
-            elif blk.get("type") == "tool_use":
-                calls.append({"id": blk["id"], "name": blk["name"],
-                              "args": blk.get("input", {})})
-        return Assistant(text=text, tool_calls=calls)
+        }
+        if on_token is None:
+            data = _http_json(self.API, payload, headers)
+            text, calls = "", []
+            for blk in data.get("content", []):
+                if blk.get("type") == "text":
+                    text += blk.get("text", "")
+                elif blk.get("type") == "tool_use":
+                    calls.append({"id": blk["id"], "name": blk["name"],
+                                  "args": blk.get("input", {})})
+            return Assistant(text=text, tool_calls=calls)
+
+        # SSE streaming: 'data: {...}' lines, content_block_start/delta/stop
+        # events. text_delta -> on_token; input_json_delta -> tool args buffer.
+        payload["stream"] = True
+        text = ""
+        tool_calls: list[dict] = []
+        current: dict | None = None
+        json_buf = ""
+        for raw in _http_stream(self.API, payload, headers):
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            try:
+                evt = json.loads(line[5:].strip())
+            except json.JSONDecodeError:
+                continue
+            t = evt.get("type")
+            if t == "content_block_start":
+                blk = evt.get("content_block", {})
+                if blk.get("type") == "tool_use":
+                    current = {"id": blk["id"], "name": blk["name"], "args": {}}
+                    json_buf = ""
+            elif t == "content_block_delta":
+                d = evt.get("delta", {})
+                if d.get("type") == "text_delta":
+                    chunk = d.get("text", "")
+                    text += chunk
+                    on_token(chunk)
+                elif d.get("type") == "input_json_delta":
+                    json_buf += d.get("partial_json", "")
+            elif t == "content_block_stop":
+                if current is not None:
+                    try:
+                        current["args"] = json.loads(json_buf) if json_buf else {}
+                    except json.JSONDecodeError:
+                        current["args"] = {}
+                    tool_calls.append(current)
+                    current = None
+                    json_buf = ""
+            elif t == "message_stop":
+                break
+        return Assistant(text=text, tool_calls=tool_calls)
 
 
 def build_client(cfg) -> "OllamaClient | AnthropicClient":

@@ -30,6 +30,9 @@ class Config:
     skills_dir: str = "skills"      # folder-based skills
     project_root: str = "."         # root used for relative-path resolution
 
+    # --- domain profile ---
+    mode: str = "eda"               # "eda" | "generic" | "auto"
+
     # --- LLM backend ---
     backend: str = "ollama"         # "ollama" | "anthropic"
     model: str = "qwen2.5:7b-instruct"
@@ -43,6 +46,16 @@ class Config:
     max_steps: int = 12             # tool-call rounds before forced wrap-up
     interactive: bool = True        # allow ask_user to block on stdin
     tool_result_char_budget: int = 6000  # truncate fat tool outputs
+
+    # --- long-chat hygiene ---
+    history_compact_threshold: int = 0   # bytes; 0 = auto (num_ctx * 2.5)
+    history_compact_keep_recent: int = 4 # keep this many newest tool results full
+    history_compact_budget: int = 400    # head+tail size for compacted result
+
+    # --- answer verification ---
+    verify_citations: bool = True   # in Mode C, check `path:line` cites resolve
+    verify_max_passes: int = 3      # how many verification iterations (incl. draft)
+    stream: bool = True             # live-print model tokens to the terminal
 
     # --- safety ---
     restrict_to_roots: bool = False  # if True, read_file cannot escape roots.

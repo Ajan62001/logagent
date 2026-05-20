@@ -7,15 +7,18 @@ It can:
 
 - **look in the logs** — `list_logs`, `read_logs` (grep / severity / head /
   tail / context, line-numbered for citation)
-- **refer to the manual** — `search_manual` (BM25 RAG over `manual/`)
+- **refer to the manual** — `search_manual` (BM25 RAG over `manual/`;
+  `.md/.txt/.rst` **and `.pdf`** docs are indexed)
 - **refer to skills** — `list_skills` / `run_skill` (folder playbooks)
 - **open files mentioned in logs** — `read_file` (the failing `.tcl/.sdc`, a
   report, a stack-trace source)
 - **ask clarifying questions** — `ask_user` when the request is ambiguous
 
-Pure stdlib, **no third-party dependencies**. Default backend is **local
-Ollama** (nothing leaves the machine — suited to a confidential domain);
-Anthropic is a drop-in alternative.
+Pure stdlib, **no required third-party dependencies**. Default backend is
+**local Ollama** (nothing leaves the machine — suited to a confidential
+domain); Anthropic is a drop-in alternative. PDF manuals are read via
+poppler's `pdftotext` if present, else `pypdf` if importable, else a
+pure-stdlib `zlib` fallback — none is required to install.
 
 ## Setup
 
@@ -106,10 +109,10 @@ always instant. Delete `*.logbidx` to force a rebuild.
 ```
 logb/        agent loop, pluggable LLM transport, BM25 RAG, CLI
 logb/tools/  one module per tool (logs, manual, skills, files, ask)
-manual/      docs corpus (sample: Innovus error reference)
+manual/      docs corpus — .md/.txt/.rst + .pdf (sample: Innovus errors)
 skills/      playbooks (sample: diagnose-missing-completion)
 logs/        sample Innovus crash log (+ referenced scripts/ files)
 tests/       offline suite (fake LLM) — `python -m pytest -q`
 ```
 
-Tests run fully offline (scripted fake client) — no Ollama needed: `11 passed`.
+Tests run fully offline (scripted fake client) — no Ollama needed: `28 passed`.

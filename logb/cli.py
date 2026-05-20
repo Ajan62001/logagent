@@ -14,8 +14,10 @@ import sys
 from .agent import Agent
 from .config import Config
 from .llm import LLMError, build_client
+from .profiles import PROFILES, resolve as resolve_profile
 from .rag import ManualIndex
 from .tools import ToolContext, build_registry
+from .tools.logs import _resolve_logs
 
 
 def _on_ask(question: str, options: list) -> str:
@@ -45,17 +47,43 @@ def _on_confirm(command: str, purpose: str) -> bool:
         return False
 
 
+def _resolve_profile_for_cfg(cfg: Config):
+    """Resolve --mode auto by sniffing the first concrete log path; otherwise
+    just map the mode string."""
+    if (cfg.mode or "").lower() == "auto":
+        # Need a log list to sniff; use the EDA-extension default for the
+        # *discovery* step (it's a superset for typical log dirs).
+        from .profiles import EDA
+        logs = _resolve_logs(cfg, EDA)
+        return resolve_profile("auto", [str(p) for p in logs])
+    return resolve_profile(cfg.mode)
+
+
+def _stream_token(s: str) -> None:
+    sys.stdout.write(s)
+    sys.stdout.flush()
+
+
 def _make_agent(cfg: Config, verbose: bool) -> Agent:
     client = build_client(cfg)
     registry = build_registry()
+    profile = _resolve_profile_for_cfg(cfg)
     ctx = ToolContext(cfg=cfg, manual_index=ManualIndex(cfg.manual_dir),
-                       on_ask=_on_ask, on_confirm=_on_confirm)
+                       on_ask=_on_ask, on_confirm=_on_confirm,
+                       profile=profile)
     trace = (lambda s: print(f"\033[90m{s}\033[0m")) if verbose else None
-    return Agent(client, registry, ctx, max_steps=cfg.max_steps, trace=trace)
+    on_token = _stream_token if cfg.stream else None
+    return Agent(client, registry, ctx, max_steps=cfg.max_steps,
+                 trace=trace, on_token=on_token)
 
 
-def _print_answer(res) -> None:
-    print(f"\n{res.answer}\n")
+def _print_answer(res, streamed: bool) -> None:
+    # When tokens were streamed live, the answer is already on screen — only
+    # print the trailing newline + step count. Otherwise print the full body.
+    if streamed:
+        print()
+    else:
+        print(f"\n{res.answer}\n")
     print(f"\033[90m[{res.steps} step(s)]\033[0m")
 
 
@@ -66,13 +94,15 @@ def _cmd_ask(cfg: Config, args) -> int:
     except LLMError as e:
         print(f"\033[31mLLM error:\033[0m {e}", file=sys.stderr)
         return 2
-    _print_answer(res)
+    _print_answer(res, streamed=cfg.stream)
     return 0
 
 
 def _cmd_chat(cfg: Config, args) -> int:
     agent = _make_agent(cfg, args.verbose)
+    profile_name = agent.ctx.profile.name
     print(f"logb — {cfg.backend}:{cfg.model if cfg.backend=='ollama' else cfg.anthropic_model}"
+          f"  | mode={cfg.mode} → profile={profile_name}"
           f"  | log={cfg.log_path}  manual={cfg.manual_dir}  skills={cfg.skills_dir}")
     print("Ask about a failure. Ctrl-D or 'exit' to quit.\n")
     while True:
@@ -86,18 +116,22 @@ def _cmd_chat(cfg: Config, args) -> int:
         if not q:
             continue
         try:
-            _print_answer(agent.ask(q))
+            _print_answer(agent.ask(q), streamed=cfg.stream)
         except LLMError as e:
             print(f"\033[31mLLM error:\033[0m {e}", file=sys.stderr)
 
 
 def _cmd_skills(cfg: Config, _args) -> int:
     from .tools.skills import _list_skills
-    print(_list_skills({}, ToolContext(cfg=cfg, manual_index=None)))
+    profile = _resolve_profile_for_cfg(cfg)
+    print(_list_skills({}, ToolContext(cfg=cfg, manual_index=None,
+                                       profile=profile)))
     return 0
 
 
 def _cmd_doctor(cfg: Config, _args) -> int:
+    profile = _resolve_profile_for_cfg(cfg)
+    print(f"mode              : {cfg.mode}  -> profile {profile.name!r}")
     print(f"backend           : {cfg.backend}")
     if cfg.backend == "ollama":
         import json
@@ -132,6 +166,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-l", "--log", dest="log_path", help="log file or directory")
     p.add_argument("--manual", dest="manual_dir", help="manual/docs directory")
     p.add_argument("--skills", dest="skills_dir", help="skills directory")
+    p.add_argument("--mode", choices=sorted(list(PROFILES) + ["auto"]),
+                   help="domain profile: eda / generic / auto (sniff)")
     p.add_argument("--backend", choices=["ollama", "anthropic"])
     p.add_argument("--model", help="ollama model id")
     p.add_argument("--max-steps", dest="max_steps", type=int)
@@ -146,6 +182,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-shell", dest="allow_shell",
                    action="store_true", default=None,
                    help="enable the run_bash tool (each command still needs approval)")
+    p.add_argument("--no-stream", dest="stream", action="store_false",
+                   default=None,
+                   help="disable token streaming (print the full answer at the end)")
+    p.add_argument("--no-verify", dest="verify_citations",
+                   action="store_false", default=None,
+                   help="skip the Mode-C citation-verification re-ask")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="trace tool calls")
 
@@ -162,9 +204,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     overrides = {k: getattr(args, k) for k in (
-        "log_path", "manual_dir", "skills_dir", "backend", "model",
+        "log_path", "manual_dir", "skills_dir", "mode", "backend", "model",
         "max_steps", "interactive", "restrict_to_roots", "allow_skill_exec",
-        "allow_shell")
+        "allow_shell", "stream", "verify_citations")
         if getattr(args, k, None) is not None}
     cfg = Config.load(overrides)
     return args.func(cfg, args)

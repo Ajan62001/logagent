@@ -11,43 +11,37 @@ import re
 from pathlib import Path
 
 from .. import index as _idx
+from ..profiles import EDA, Profile
 from .base import Tool, ToolContext, truncate
 
-# Heuristic severity tokens seen across EDA tools (Innovus/PrimeTime/VCS/etc.).
-_SEV = {
-    "fatal": re.compile(r"\b(FATAL|PANIC|ABORT|core dumped|Segmentation fault)\b", re.I),
-    "error": re.compile(r"\b(ERROR|ERR|\*\*ERROR|FAIL(ED|URE)?)\b", re.I),
-    "warn":  re.compile(r"\b(WARN(ING)?|\*\*WARN)\b", re.I),
-}
 
-
-def _resolve_logs(cfg) -> list[Path]:
+def _resolve_logs(cfg, profile: Profile = EDA) -> list[Path]:
     p = Path(cfg.log_path)
     if p.is_dir():
+        exts = profile.log_extensions
         return sorted(f for f in p.rglob("*")
-                      if f.is_file() and f.suffix.lower() in
-                      {".log", ".rpt", ".txt", ".out", ""})
+                      if f.is_file() and f.suffix.lower() in exts)
     return [p] if p.is_file() else []
 
 
 def _list_logs(args: dict, ctx: ToolContext) -> str:
-    logs = _resolve_logs(ctx.cfg)
+    logs = _resolve_logs(ctx.cfg, ctx.profile)
     if not logs:
         return f"No log files found at {ctx.cfg.log_path!r}."
     lines = []
     for f in logs:
         try:
             kb = f.stat().st_size / 1024
-            n = _idx.load_or_build(f)["total"]   # streamed/cached, not loaded
+            n = _idx.load_or_build(f, ctx.profile)["total"]   # cached
         except OSError:
             n, kb = -1, -1
         lines.append(f"{f}  ({n} lines, {kb:.0f} KB)")
     return "Available logs:\n" + "\n".join(lines)
 
 
-def _pick_file(args: dict, cfg) -> Path | None:
+def _pick_file(args: dict, cfg, profile: Profile = EDA) -> Path | None:
     want = args.get("path")
-    logs = _resolve_logs(cfg)
+    logs = _resolve_logs(cfg, profile)
     if want:
         wp = Path(want)
         for f in logs:
@@ -58,7 +52,7 @@ def _pick_file(args: dict, cfg) -> Path | None:
 
 
 def _read_logs(args: dict, ctx: ToolContext) -> str:
-    f = _pick_file(args, ctx.cfg)
+    f = _pick_file(args, ctx.cfg, ctx.profile)
     if f is None or not f.is_file():
         return (f"Log not found: {args.get('path')!r}. "
                 f"Call list_logs to see available files.")
@@ -70,15 +64,16 @@ def _read_logs(args: dict, ctx: ToolContext) -> str:
     ctx_lines = int(args.get("context", 2))
     max_lines = int(args.get("max_lines", 200))
 
+    sev_map = ctx.profile.severity
     rx = re.compile(pattern, re.I) if pattern else None
     # Tolerant severity parsing: accept "error", "error,fatal", "ERROR fatal",
     # "warn" etc. (The model routinely passes combined values; silently
     # ignoring them is how real errors get buried.)
-    sev_names = [t for t in re.split(r"[,\s/|]+", severity) if t in _SEV]
-    sev_res = [_SEV[t] for t in sev_names]
+    sev_names = [t for t in re.split(r"[,\s/|]+", severity) if t in sev_map]
+    sev_res = [sev_map[t] for t in sev_names]
 
     try:
-        idx = _idx.load_or_build(f)            # one cached streaming pass
+        idx = _idx.load_or_build(f, ctx.profile)   # one cached streaming pass
     except OSError as e:
         return f"ERROR indexing {f}: {e}"
     total = idx["total"]

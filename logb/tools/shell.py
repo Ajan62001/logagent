@@ -68,7 +68,7 @@ def _run_bash(args: dict, ctx: ToolContext) -> str:
 
     # Hand the resolved log path(s) to the shell so a weak model never has to
     # retype a long path: it can just use "$LOGB_LOG".
-    logs = [str(p.resolve()) for p in _resolve_logs(cfg)]
+    logs = [str(p.resolve()) for p in _resolve_logs(cfg, ctx.profile)]
     env = dict(os.environ)
     if logs:
         env["LOGB_LOG"] = logs[0]

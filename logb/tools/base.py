@@ -17,6 +17,16 @@ class ToolContext:
     manual_index: object        # logb.rag.ManualIndex
     on_ask: Callable[[str, list], str] | None = None     # ask_user front-end
     on_confirm: Callable[[str, str], bool] | None = None  # run_bash approval
+    profile: object = None      # logb.profiles.Profile (resolved at session start)
+
+    def __post_init__(self) -> None:
+        # Default to the EDA profile when the caller didn't supply one — keeps
+        # older test helpers and direct ToolContext(...) constructions working
+        # while every CLI/Agent path now resolves the profile explicitly.
+        if self.profile is None:
+            from ..profiles import resolve   # local import avoids a cycle
+            mode = getattr(self.cfg, "mode", "eda")
+            self.profile = resolve(mode)
 
 
 @dataclass

@@ -2,6 +2,7 @@
 name: diagnose-missing-completion
 description: Trace an Innovus run that crashed or ended with no completion banner back to its first causal error
 when_to_use: FATAL / core dumped / Signal 11 / run ends with no final "Ending" banner, or a cascade of stage errors
+domain: eda
 executable: false
 ---
 

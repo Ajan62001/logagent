@@ -17,12 +17,12 @@ _RANK = {"fatal": 0, "error": 1, "warn": 2}
 
 
 def _log_summary(args: dict, ctx: ToolContext) -> str:
-    f = _pick_file(args, ctx.cfg)
+    f = _pick_file(args, ctx.cfg, ctx.profile)
     if f is None or not f.is_file():
         return (f"Log not found: {args.get('path')!r}. "
                 f"Call list_logs to see available files.")
     try:
-        idx = _idx.load_or_build(f)
+        idx = _idx.load_or_build(f, ctx.profile)
     except OSError as e:
         return f"ERROR indexing {f}: {e}"
 
