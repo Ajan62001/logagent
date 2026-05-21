@@ -18,6 +18,14 @@ class ToolContext:
     on_ask: Callable[[str, list], str] | None = None     # ask_user front-end
     on_confirm: Callable[[str, str], bool] | None = None  # run_bash approval
     profile: object = None      # logb.profiles.Profile (resolved at session start)
+    # Deep-agent state. `_agent` is a back-reference the running Agent
+    # writes into the context so delegate_subtask can spawn child agents
+    # without an explicit dependency injection through tool dispatch.
+    # `_delegation_depth` caps recursion (parent=0, child=1, ...).
+    _agent: object = None
+    _delegation_depth: int = 0
+    # `plan` is attached lazily by the plan tools (see tools/plan.py).
+    plan: object = None
 
     def __post_init__(self) -> None:
         # Default to the EDA profile when the caller didn't supply one — keeps
@@ -35,6 +43,11 @@ class Tool:
     description: str
     parameters: dict            # JSON schema (object)
     run: Callable[[dict, ToolContext], str]
+    # When set, schemas() filters this tool out unless the active profile
+    # matches. Domain-specific tools (e.g. EDA stage_timeline) shouldn't
+    # pollute the schema list in a generic-mode session — the model would
+    # waste a step calling something irrelevant.
+    profile_required: str | None = None
 
     def schema(self) -> dict:
         return {"name": self.name, "description": self.description,
@@ -48,14 +61,31 @@ class ToolRegistry:
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
 
-    def schemas(self) -> list[dict]:
-        return [t.schema() for t in self._tools.values()]
+    def schemas(self, profile_name: str | None = None) -> list[dict]:
+        out = []
+        for t in self._tools.values():
+            if (t.profile_required is not None
+                    and profile_name is not None
+                    and t.profile_required != profile_name):
+                continue
+            out.append(t.schema())
+        return out
 
     def dispatch(self, name: str, args: dict, ctx: ToolContext) -> str:
         tool = self._tools.get(name)
         if tool is None:
             return (f"ERROR: unknown tool {name!r}. "
                     f"Available: {', '.join(self._tools)}")
+        # Tool-level profile gate. Even if a tool was somehow invoked in a
+        # session where its required profile isn't active, refuse loudly
+        # rather than running domain-specific logic on the wrong log type.
+        if (tool.profile_required is not None
+                and getattr(ctx.profile, "name", None) != tool.profile_required):
+            return (f"ERROR: tool {name!r} requires the "
+                    f"{tool.profile_required!r} profile (active: "
+                    f"{getattr(ctx.profile, 'name', 'unknown')!r}). "
+                    "Re-launch with --mode "
+                    f"{tool.profile_required} if this log is that domain.")
         try:
             return tool.run(args or {}, ctx)
         except Exception as e:  # never let a tool crash the agent loop

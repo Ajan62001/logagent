@@ -34,6 +34,12 @@ class LLMError(RuntimeError):
 class Assistant:
     text: str = ""
     tool_calls: list[dict] = field(default_factory=list)  # [{id,name,args}]
+    # Telemetry from the backend response. None = unavailable (some
+    # backends don't report these). The agent accumulates them for the
+    # per-turn audit/trace footer and the eval harness.
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    latency_ms: int | None = None
 
     @property
     def wants_tools(self) -> bool:
@@ -125,6 +131,7 @@ class OllamaClient:
         """When `on_token` is supplied, stream text deltas to it as they
         arrive (transforms a 30 s blank wait into live output). Tool calls
         and the final Assistant payload are unchanged either way."""
+        import time
         payload = {
             "model": self.model,
             "messages": self._messages(system, history),
@@ -134,16 +141,25 @@ class OllamaClient:
         }
         url = f"{self.host}/api/chat"
         headers = {"Content-Type": "application/json"}
+        t0 = time.monotonic()
         if on_token is None:
             data = _http_json(url, payload, headers)
             msg = data.get("message", {})
-            return Assistant(text=msg.get("content", "") or "",
-                             tool_calls=self._extract_tool_calls(msg))
+            return Assistant(
+                text=msg.get("content", "") or "",
+                tool_calls=self._extract_tool_calls(msg),
+                tokens_in=data.get("prompt_eval_count"),
+                tokens_out=data.get("eval_count"),
+                latency_ms=int((time.monotonic() - t0) * 1000),
+            )
 
-        # Streaming: each line is a complete JSON chunk (NDJSON). Some chunks
-        # carry text deltas, the final chunk carries tool_calls + done=True.
+        # Streaming: each line is a complete JSON chunk (NDJSON). The final
+        # `done=true` chunk carries the cumulative prompt_eval_count /
+        # eval_count fields that we surface as token telemetry.
         text_parts: list[str] = []
         tool_calls: list[dict] = []
+        tokens_in: int | None = None
+        tokens_out: int | None = None
         for raw in _http_stream(url, payload, headers):
             line = raw.strip()
             if not line:
@@ -160,8 +176,16 @@ class OllamaClient:
             if msg.get("tool_calls"):
                 tool_calls = self._extract_tool_calls(msg)
             if obj.get("done"):
+                tokens_in = obj.get("prompt_eval_count")
+                tokens_out = obj.get("eval_count")
                 break
-        return Assistant(text="".join(text_parts), tool_calls=tool_calls)
+        return Assistant(
+            text="".join(text_parts),
+            tool_calls=tool_calls,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            latency_ms=int((time.monotonic() - t0) * 1000),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -207,6 +231,7 @@ class AnthropicClient:
 
     def chat(self, system: str, history: list[dict], tools: list[dict],
              on_token=None) -> Assistant:
+        import time
         payload = {
             "model": self.model,
             "max_tokens": self.max_tokens,
@@ -221,6 +246,7 @@ class AnthropicClient:
             "x-api-key": self.key,
             "anthropic-version": "2023-06-01",
         }
+        t0 = time.monotonic()
         if on_token is None:
             data = _http_json(self.API, payload, headers)
             text, calls = "", []
@@ -230,7 +256,13 @@ class AnthropicClient:
                 elif blk.get("type") == "tool_use":
                     calls.append({"id": blk["id"], "name": blk["name"],
                                   "args": blk.get("input", {})})
-            return Assistant(text=text, tool_calls=calls)
+            usage = data.get("usage", {}) or {}
+            return Assistant(
+                text=text, tool_calls=calls,
+                tokens_in=usage.get("input_tokens"),
+                tokens_out=usage.get("output_tokens"),
+                latency_ms=int((time.monotonic() - t0) * 1000),
+            )
 
         # SSE streaming: 'data: {...}' lines, content_block_start/delta/stop
         # events. text_delta -> on_token; input_json_delta -> tool args buffer.
@@ -239,6 +271,8 @@ class AnthropicClient:
         tool_calls: list[dict] = []
         current: dict | None = None
         json_buf = ""
+        tokens_in: int | None = None
+        tokens_out: int | None = None
         for raw in _http_stream(self.API, payload, headers):
             line = raw.decode("utf-8", "replace").strip()
             if not line.startswith("data:"):
@@ -248,7 +282,10 @@ class AnthropicClient:
             except json.JSONDecodeError:
                 continue
             t = evt.get("type")
-            if t == "content_block_start":
+            if t == "message_start":
+                usage = evt.get("message", {}).get("usage", {}) or {}
+                tokens_in = usage.get("input_tokens", tokens_in)
+            elif t == "content_block_start":
                 blk = evt.get("content_block", {})
                 if blk.get("type") == "tool_use":
                     current = {"id": blk["id"], "name": blk["name"], "args": {}}
@@ -270,9 +307,16 @@ class AnthropicClient:
                     tool_calls.append(current)
                     current = None
                     json_buf = ""
+            elif t == "message_delta":
+                usage = evt.get("usage", {}) or {}
+                tokens_out = usage.get("output_tokens", tokens_out)
             elif t == "message_stop":
                 break
-        return Assistant(text=text, tool_calls=tool_calls)
+        return Assistant(
+            text=text, tool_calls=tool_calls,
+            tokens_in=tokens_in, tokens_out=tokens_out,
+            latency_ms=int((time.monotonic() - t0) * 1000),
+        )
 
 
 def build_client(cfg) -> "OllamaClient | AnthropicClient":

@@ -56,9 +56,27 @@ MODE C — ROOT-CAUSE / DEBUG  ("why did it fail", "root cause", "fix the
       script/SDC"). Then execute the plan one task at a time, calling
       update_plan(idx=N, status='done', result='<one line>') after each
       tool result. The plan is rendered in your system context on every
-      step so you can see what's done and what's next. Finally emit the
-      four-section template (## Root Cause / ## Evidence / ## Fix /
-      ## Suggestions to Improve) — the ONLY mode that produces it.
+      step so you can see what's done and what's next.
+
+      THE PLAN IS A LIVE WORK-QUEUE, NOT A ONE-SHOT LIST:
+        - Many tools (log_summary, code_lookup, search_manual) emit
+          `[N] <tool>(args)` TODO lines in their results. These are
+          AUTO-APPENDED to your plan as pending tasks — you do not
+          need to manually call update_plan(add_tasks=...) for them.
+        - When YOU read a tool result and realise you need MORE info
+          (a referenced file you haven't read, a related code you
+          haven't looked up, a hypothesis to confirm), CALL
+          update_plan(add_tasks=['<the new action>']) to register it.
+          Then execute it. Do not skip work just because the plan
+          didn't list it up front.
+        - Before emitting the final answer you MUST have zero pending
+          tasks. The verifier checks this. If the plan still has open
+          tasks, work them down — don't bail out with an incomplete
+          investigation.
+
+      Finally emit the four-section template (## Root Cause /
+      ## Evidence / ## Fix / ## Suggestions to Improve) — the ONLY
+      mode that produces it.
 
 If you genuinely cannot tell A vs B vs C, call ask_user — do NOT default to C.
 
@@ -85,6 +103,37 @@ Tools:
 
 Cross-cutting: cite evidence as `file:line`; never assert something you did
 not see in a tool result; be precise and terse.
+
+Tool-call protocol (CRITICAL — failing this guarantees a wrong answer):
+- To call a tool, emit it through the function-calling protocol. Your
+  client will marshal the call and return the result as a tool message.
+- NEVER write a tool-call JSON object like
+  `{"name": "search_manual", "arguments": {...}}`
+  inside your TEXT reply. Text written that way is just prose; the tool
+  does NOT execute. Any content you derive from such a "call" is
+  hallucinated. The runtime now detects this pattern and rejects answers
+  that contain it.
+- Your text reply is for: (a) the FINAL ANSWER for the user, or
+  (b) a brief justification before tool calls. Nothing else.
+
+Repeat-call discipline (CRITICAL): if you've already called a tool with
+specific arguments and got a result THIS TURN, do NOT call the same tool
+with the same arguments again — the result will not change and the
+runtime will refuse the call. Either:
+  - use the prior result that's still in your history, or
+  - change the arguments, or
+  - call a different tool, or
+  - emit your final answer if you have enough information.
+
+Delegation (`delegate_subtask`): when a plan step is itself multi-tool work
+that would clutter your history (e.g. "investigate everything about the
+CTS stage", "cross-check each error against the manual"), call
+delegate_subtask(focus="<one-line goal>", max_steps=N). The sub-agent runs
+silently with its own history, calls whatever tools it needs, and returns
+ONE summary back to you. Recursion depth is capped at 2 — don't try to
+delegate from inside a delegation more than once. Sub-agents cannot ask
+the user or run shell. Don't delegate for simple single-tool steps; the
+overhead isn't worth it.
 
 Durable memory (`save_note` / `get_note` / `list_notes` / `delete_note`):
 the conversation history is volatile — it gets truncated once the context
@@ -154,6 +203,14 @@ class AgentResult:
     answer: str
     steps: int
     transcript: list[dict]
+    # Per-turn accumulated telemetry. Token counts and latency_ms may be
+    # None if the backend didn't report them (rare; both Ollama and
+    # Anthropic do). The eval harness consumes these to score efficiency.
+    tokens_in: int = 0
+    tokens_out: int = 0
+    latency_ms: int = 0
+    llm_calls: int = 0
+    verification_passes: int = 1
 
 
 def _session_context(ctx: ToolContext) -> str:
@@ -229,6 +286,169 @@ def _compact_tool_result(result: str, budget: int) -> str:
 #  Mode-C answer and confirm each cited line actually exists. Catches the     #
 #  most common hallucination class (cite-drift) before the answer is shown.   #
 # --------------------------------------------------------------------------- #
+# A JSON object that *looks like* a tool call written in the response text
+# instead of being emitted through the function-calling protocol. The model
+# sometimes does this when confused — e.g. emits dozens of {"name": "X",
+# "arguments": {...}} blocks in markdown ```json fences. Those blocks DO
+# NOT execute; they're just text. We detect them so verification can
+# reject the answer and force the model to use the real protocol.
+_TOOL_CALL_IN_TEXT_RX = re.compile(
+    r'\{\s*"name"\s*:\s*"(?P<name>[A-Za-z_][A-Za-z0-9_]*)"\s*,\s*'
+    r'"arguments"\s*:\s*\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}\s*\}',
+    re.DOTALL,
+)
+
+
+def _detect_tool_calls_in_text(text: str) -> list[str]:
+    """Names of tool-call blocks the model emitted as text (not protocol).
+    Returns the list of names (with duplicates) — empty list means clean."""
+    return [m.group("name") for m in _TOOL_CALL_IN_TEXT_RX.finditer(text)]
+
+
+_DEDUP_IGNORE_ARGS = {
+    # When the agent already has a target log configured, an explicit
+    # `path` argument that names that same log is a no-op — drop it
+    # from the dedup signature so the model can't bypass the cap by
+    # appending it.
+    "path", "file",
+}
+
+
+def _tool_call_signature(name: str, args: dict) -> str:
+    """Canonical (name, args) string for dup detection within a turn.
+
+    Args whose name is in _DEDUP_IGNORE_ARGS (e.g. `path=` for a tool
+    that already defaults to the target log) are stripped so the model
+    can't escape the duplicate cap by appending a redundant kwarg.
+    """
+    args = {k: v for k, v in (args or {}).items()
+            if k not in _DEDUP_IGNORE_ARGS}
+    try:
+        argstr = json.dumps(args, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        argstr = repr(args)
+    return f"{name}:{argstr}"
+
+
+# --------------------------------------------------------------------------- #
+#  Quoted-text + numeric-claim verification.                                  #
+#                                                                             #
+#  The _path:line_ cite checker catches a specific shape; the model can       #
+#  still slip in confabulations like:                                         #
+#    - a backtick-quoted literal that doesn't appear in any tool result, OR   #
+#    - a count ("47 ERROR, 2 FATAL") that contradicts log_summary.            #
+#                                                                             #
+#  These two checks below close that gap. Both are conservative — they only   #
+#  flag claims whose source IS structurally present in the transcript, so     #
+#  they don't false-positive on novel paraphrasing.                            #
+# --------------------------------------------------------------------------- #
+
+# Backtick-quoted text of substantial length. Cite forms like `top.sdc:88` are
+# handled by _CITE_RX and excluded here, since they're meant to be checked
+# differently (file existence, not transcript presence).
+_QUOTED_TEXT_RX = re.compile(r"`([^`\n]{20,})`")
+_CITE_SHAPE_RX = re.compile(r"^[\w./\\\-]+\.[\w]{1,8}[:][\d]+\b")
+
+# "47 ERROR", "2 FATAL", "310 WARN" / "WARNING" — the kind of count the model
+# emits in Mode A or when summarizing.
+_NUMERIC_CLAIM_RX = re.compile(
+    r"\b(\d+)\s+(FATAL|ERROR|WARN(?:ING)?)\b", re.I)
+
+# Parse log_summary output to extract the authoritative counts. Matches the
+# header line "EXACT counts (whole file): 2 FATAL · 4 ERROR · 2 WARN ..."
+_SUMMARY_COUNT_RX = re.compile(
+    r"(\d+)\s+(FATAL|ERROR|WARN(?:ING)?)", re.I)
+
+
+def _collect_tool_haystack(history: list) -> str:
+    """Concatenate all tool-result text so we can substring-check claims."""
+    return "\n".join(h.get("result", "") for h in history
+                     if h.get("role") == "tool")
+
+
+def _find_quoted_text_problems(answer: str, history: list) -> list[str]:
+    """Flag any backtick-quoted substring (≥20 chars) in the answer that
+    doesn't appear in any tool result. Catches the 'paraphrase as literal
+    quote' failure mode where the model fabricates a quote that resembles
+    what a tool would say."""
+    if not history:
+        return []
+    haystack = _collect_tool_haystack(history)
+    if not haystack:
+        return []
+    seen: set[str] = set()
+    problems: list[str] = []
+    for m in _QUOTED_TEXT_RX.finditer(answer):
+        quoted = m.group(1).strip()
+        if not quoted or quoted in seen:
+            continue
+        seen.add(quoted)
+        # Skip cite-shaped quotes (path:line) — handled by _verify_citations.
+        if _CITE_SHAPE_RX.match(quoted):
+            continue
+        if quoted in haystack:
+            continue
+        # Fall back to checking a 40-char prefix — handles small paraphrases
+        # of long literals (the model may have wrapped/truncated mid-quote).
+        prefix = quoted[:40]
+        if len(prefix) >= 20 and prefix in haystack:
+            continue
+        # Definitively absent from the transcript. Real failure.
+        display = quoted if len(quoted) <= 60 else quoted[:60] + "…"
+        problems.append(
+            f"  - quoted text `{display}` does NOT appear in any tool "
+            "result this turn — the quote is fabricated or paraphrased "
+            "rather than literal.")
+    return problems
+
+
+def _extract_summary_counts(history: list) -> dict[str, int] | None:
+    """The most recent log_summary tool result's exact counts, or None."""
+    for h in reversed(history):
+        if (h.get("role") == "tool"
+                and h.get("name") == "log_summary"):
+            result = h.get("result", "")
+            # Look for the header line with counts. Avoid matching the
+            # code table rows (which are per-code, not whole-file).
+            header_match = re.search(
+                r"EXACT counts[^\n]*?:\s*(.+)", result)
+            if not header_match:
+                return None
+            counts: dict[str, int] = {}
+            for n, sev in _SUMMARY_COUNT_RX.findall(header_match.group(1)):
+                k = sev.upper().replace("WARNING", "WARN")
+                counts[k] = int(n)
+            return counts
+    return None
+
+
+def _find_numeric_claim_problems(answer: str, history: list) -> list[str]:
+    """If the answer asserts 'N ERROR' / 'N FATAL' / 'N WARN' counts and a
+    log_summary call this turn returned different counts, flag the
+    contradiction. Mode-A answers especially benefit — they should
+    parrot log_summary verbatim and otherwise are wrong."""
+    counts = _extract_summary_counts(history)
+    if not counts:
+        return []
+    seen: set[tuple[int, str]] = set()
+    problems: list[str] = []
+    for m in _NUMERIC_CLAIM_RX.finditer(answer):
+        n = int(m.group(1))
+        sev = m.group(2).upper().replace("WARNING", "WARN")
+        if (n, sev) in seen:
+            continue
+        seen.add((n, sev))
+        expected = counts.get(sev)
+        if expected is None:
+            continue
+        if n != expected:
+            problems.append(
+                f"  - numeric claim '{n} {sev}' contradicts log_summary "
+                f"(exact: {expected} {sev}). The answer must quote the "
+                "log_summary counts verbatim.")
+    return problems
+
+
 _CITE_RX = re.compile(
     # Accept both `path:line` and `path line N` / `path on line N`, with
     # the path optionally wrapped in backticks. The model routinely writes
@@ -273,33 +493,94 @@ def _extract_cites(text: str) -> list[tuple[str, int]]:
 
 
 def _resolve_cite_path(raw: str, cfg) -> Path | None:
+    """Resolve a `path:line` cite back to a real file.
+
+    The model writes cites in many shapes:
+      • the bare basename of the target log (`test.log:1234`)
+      • a relative path whose suffix matches the target log
+        (`innovus_log/test.log:1234` when log_path is
+         `/abs/path/innovus_log/test.log`)
+      • a path relative to `project_root`
+      • a path relative to the manual / skills dir
+      • an absolute path
+
+    We try all of these and ALSO search by basename under both
+    `project_root` AND the directory containing the target log — that
+    second root matters when the user runs logb with --log pointing
+    far outside the project tree (the common case for prod logs).
+    """
     p = Path(raw)
+    # 1. Absolute path that already exists.
     if p.is_absolute() and p.is_file():
         return p
-    candidates = [
-        Path(cfg.project_root) / raw,
-        Path(cfg.log_path).parent / raw if Path(cfg.log_path).is_file()
-        else Path(cfg.log_path) / raw,
-        Path(cfg.manual_dir) / raw,
-        Path(cfg.skills_dir) / raw,
-        p,
-    ]
+
+    log_path = Path(cfg.log_path)
+    log_is_file = log_path.is_file()
+    log_is_dir = log_path.is_dir()
+
+    # 2. The most common case: the cite refers to the TARGET log itself.
+    #    Accept by basename match or by suffix match so abbreviated paths
+    #    (`innovus_log/test.log` when log is `/abs/.../innovus_log/test.log`)
+    #    resolve to log_path directly.
+    if log_is_file:
+        if p.name == log_path.name:
+            return log_path
+        raw_norm = raw.replace("\\", "/")
+        log_norm = str(log_path).replace("\\", "/")
+        if log_norm.endswith("/" + raw_norm) or log_norm.endswith(raw_norm):
+            return log_path
+
+    # 3. Standard candidate locations.
+    candidates: list[Path] = []
+    candidates.append(Path(cfg.project_root) / raw)
+    if log_is_file:
+        candidates.append(log_path.parent / raw)
+    elif log_is_dir:
+        candidates.append(log_path / raw)
+        # Also try without the leading dir component, in case the cite
+        # already includes the log_path's tail.
+        try:
+            stripped = Path(raw).relative_to(log_path.name)
+            candidates.append(log_path / stripped)
+        except ValueError:
+            pass
+    candidates.append(Path(cfg.manual_dir) / raw)
+    candidates.append(Path(cfg.skills_dir) / raw)
+    candidates.append(p)             # bare relative-to-cwd
+
+    seen: set = set()
     for c in candidates:
+        try:
+            key = str(c.resolve())
+        except OSError:
+            key = str(c)
+        if key in seen:
+            continue
+        seen.add(key)
         try:
             if c.is_file():
                 return c
         except OSError:
             continue
-    # Last resort: search by basename under project_root (cheap because
-    # rglob is lazy and we cap at the first hit).
-    root = Path(cfg.project_root)
-    if root.is_dir():
+
+    # 4. Basename rglob under BOTH project_root and the log directory.
+    #    The log dir matters when --log points outside project_root
+    #    (common in prod), which the old single-root rglob missed.
+    name = p.name
+    search_roots = [Path(cfg.project_root)]
+    log_root = log_path.parent if log_is_file else (
+        log_path if log_is_dir else None)
+    if log_root is not None and log_root not in search_roots:
+        search_roots.append(log_root)
+    for root in search_roots:
         try:
-            for found in root.rglob(p.name):
+            if not root.is_dir():
+                continue
+            for found in root.rglob(name):
                 if found.is_file():
                     return found
         except OSError:
-            pass
+            continue
     return None
 
 
@@ -369,6 +650,183 @@ def _claims_manual_without_calling_it(answer: str, tools_used: set[str]) -> bool
     return bool(_MANUAL_CLAIM_RX.search(answer))
 
 
+# `[N] code_lookup(code='IMPLF-213')` style TODO items emitted by
+# log_summary / code_lookup / search_manual. We extract these and check
+# they were actually executed before letting a Mode-C answer through.
+_TODO_CALL_RX = re.compile(
+    r"\[\d+\]\s+(\w+)\(([^)]*)\)")
+
+
+def _normalise_call(tool: str, args_str: str) -> str:
+    """Canonicalise a (tool, args) pair so we can match plan tasks against
+    tool calls regardless of quote style or whitespace."""
+    norm = re.sub(r"['\"]", "", args_str).replace(" ", "")
+    return f"{tool}({norm})"
+
+
+_CODE_LOOKUP_LINE_RX = re.compile(
+    r"In log \(([^)]+)\):\s*(\d+)\s*occurrence\(s\),\s*severity=(\w+),"
+    r"\s*first at L(\d+)\s*\n\s*>\s*(.*)")
+# Pull the top manual hit out of a code_lookup result. The location may
+# be plain  `file`,  `file:LINE`, or  `file:LINE (page N)` — the new
+# chunker emits the richer forms; the regex stays permissive so older
+# tool results still parse.
+_CODE_LOOKUP_MANUAL_RX = re.compile(
+    r"\[1\]\s+(\S+?)(?::(\d+))?(?:\s+\(page (\d+)\))?\s+>\s+"
+    r"([^\n(]+?)\s+\(score ([\d.]+)\)\s*\n"
+    r"\s+(.{20,400})")
+
+
+def _extract_evidence_for_investigated_codes(
+        history: list[dict], turn_start: int) -> str:
+    """For every code_lookup(code=X) called this turn, return a ready-
+    made Markdown Evidence bullet block — literal log line PLUS the top
+    manual hit (heading + snippet) — that the model can paste verbatim.
+
+    The model's persistent failure mode on small local models is
+    fabricating quotes and dropping manual citations from Evidence. By
+    pre-extracting both halves directly out of the tool result and
+    pasting them into the verification feedback, the model just has to
+    copy instead of recall.
+    """
+    by_code: dict[str, str] = {}
+    investigated_order: list[str] = []
+    for h in history[turn_start:]:
+        if h.get("role") == "assistant":
+            for tc in h.get("tool_calls", []) or []:
+                if tc.get("name") == "code_lookup":
+                    code = str((tc.get("args") or {}).get("code") or "")
+                    code = code.strip().upper()
+                    if code and code not in investigated_order:
+                        investigated_order.append(code)
+        elif h.get("role") == "tool" and h.get("name") == "code_lookup":
+            result = h.get("result") or ""
+            m_hdr = re.search(r"# code_lookup:\s*(\S+)",
+                              result.split("\n", 1)[0])
+            code = m_hdr.group(1).strip().upper() if m_hdr else None
+            if not code:
+                continue
+            m_log = _CODE_LOOKUP_LINE_RX.search(result)
+            m_man = _CODE_LOOKUP_MANUAL_RX.search(result)
+            manual_not_found = "From manual: NOT FOUND" in result
+            if not m_log:
+                continue
+            fname, _count, _sev, lineno, msg = m_log.groups()
+            msg = msg.strip()
+            if len(msg) > 200:
+                msg = msg[:200]
+            bullet = f"- `{fname}:{lineno}` → {msg}"
+            if m_man and not manual_not_found:
+                src, m_line, m_page, heading, _score, snippet = m_man.groups()
+                snippet = snippet.strip().replace("\n", " ")
+                if len(snippet) > 220:
+                    snippet = snippet[:220].rstrip() + "…"
+                from os.path import basename
+                loc = f"`{basename(src)}"
+                if m_line:
+                    loc += f":{m_line}"
+                loc += "`"
+                if m_page:
+                    loc += f" (page {m_page})"
+                bullet += (f"\n  Manual: {loc} > {heading.strip()} — "
+                           f"{snippet}")
+            elif manual_not_found:
+                bullet += f"\n  Manual: no entry for {code}"
+            by_code[code] = bullet
+    if not by_code:
+        return ""
+    bullets = [by_code[c] for c in investigated_order if c in by_code]
+    if not bullets:
+        return ""
+    return "\n".join(bullets)
+
+
+def _sync_plan_from_tool(plan, tc: dict, result: str) -> None:
+    """After a tool dispatches, keep the plan in sync:
+      1. If the just-executed call was already a pending plan task, mark
+         it done (the result text becomes its summary).
+      2. Auto-append every `[N] <tool>(args)` TODO line emitted by the
+         tool as a new pending plan task (deduped against the plan).
+    This makes the plan the live work-queue: tools push new work into it,
+    the model works it down, and the verifier checks it before answering.
+    """
+    if plan is None:
+        return
+    # Imported here to avoid a top-level cycle with logb.tools.plan.
+    from .tools.plan import MAX_TASKS, MAX_TEXT_LEN, Task
+
+    name = tc.get("name", "") or ""
+    args = tc.get("args") or {}
+    args_repr = ",".join(f"{k}={v}" for k, v in args.items())
+    just_done = _normalise_call(name, args_repr)
+
+    existing_norm: set[str] = set()
+    for t in plan.tasks:
+        m = _TODO_CALL_RX.search(t.text) or re.match(
+            r"\s*(\w+)\((.*)\)", t.text)
+        if m:
+            existing_norm.add(_normalise_call(m.group(1), m.group(2)))
+        # Mark a matching pending task as done.
+        if t.status == "pending" and m:
+            cand = _normalise_call(m.group(1), m.group(2))
+            if cand == just_done:
+                t.status = "done"
+                if result:
+                    snippet = result.strip().splitlines()
+                    t.result = (snippet[0][:200] if snippet
+                                else "(executed)")[:200]
+
+    if not result:
+        return
+    proposed: list[str] = []
+    for m in _TODO_CALL_RX.finditer(result):
+        norm = _normalise_call(m.group(1), m.group(2))
+        if norm in existing_norm:
+            continue
+        existing_norm.add(norm)
+        # Store the human-readable form so the plan render reads naturally.
+        proposed.append(f"{m.group(1)}({m.group(2).strip()})")
+
+    if not proposed:
+        return
+    room = MAX_TASKS - len(plan.tasks)
+    if room <= 0:
+        return
+    start = max((t.idx for t in plan.tasks), default=0) + 1
+    for i, text in enumerate(proposed[:room]):
+        plan.tasks.append(Task(idx=start + i, text=text[:MAX_TEXT_LEN]))
+
+
+def _extract_pending_todos(history: list[dict],
+                            turn_start: int) -> list[tuple[str, str]]:
+    """Pull every `[N] <tool>(...)` line out of tool results in this turn,
+    then subtract the calls the model has already made. The remainder is
+    work the model is told to do but hasn't. Returns (tool_name, args_str)
+    pairs sorted by first appearance."""
+    proposed: list[tuple[str, str]] = []
+    seen_proposed: set[tuple[str, str]] = set()
+    executed: set[tuple[str, str]] = set()
+    for h in history[turn_start:]:
+        if h.get("role") == "tool":
+            for m in _TODO_CALL_RX.finditer(h.get("result", "") or ""):
+                tool = m.group(1)
+                args_str = m.group(2).strip()
+                # Normalise: code='X' -> code=X (strip quote variants).
+                norm = re.sub(r"['\"]", "", args_str).replace(" ", "")
+                key = (tool, norm)
+                if key not in seen_proposed:
+                    seen_proposed.add(key)
+                    proposed.append(key)
+        elif h.get("role") == "assistant":
+            for tc in h.get("tool_calls", []) or []:
+                tname = tc.get("name", "")
+                args = tc.get("args") or {}
+                args_str = ",".join(f"{k}={v}" for k, v in args.items())
+                executed.add((tname, re.sub(r"['\"]", "",
+                                              args_str).replace(" ", "")))
+    return [p for p in proposed if p not in executed]
+
+
 def _is_mode_c(answer: str) -> bool:
     return "## Root Cause" in answer or "## Evidence" in answer
 
@@ -385,6 +843,10 @@ class Agent:
         self.trace = trace or (lambda _s: None)
         self.on_token = on_token       # live-stream callback (CLI) or None (tests)
         self.history: list[dict] = []
+        self.session_id: str | None = None  # set by save_session / load_session
+        # Back-reference so delegate_subtask can find this Agent (its client
+        # and registry) from inside a tool dispatch without a circular import.
+        ctx._agent = self
         self.system = _build_system_prompt(ctx)
 
     # ----- long-chat hygiene -----
@@ -421,8 +883,7 @@ class Agent:
                        f"history now {_history_bytes(self.history)} bytes]")
 
     # ----- answer verification (cites + manual claims + tool-call sanity) -----
-    @staticmethod
-    def _find_problems(answer: str, cfg, tools_used: set[str]) -> list[str]:
+    def _find_problems(self, answer: str, cfg, tools_used: set[str]) -> list[str]:
         problems: list[str] = []
 
         # 1. Mode-C `path:line` citations.
@@ -446,16 +907,166 @@ class Agent:
                 "  - the answer claims to reference / consult the manual "
                 "but search_manual was NOT called in this turn — the "
                 "supposed manual content is uncorroborated")
+
+        # 4. Tool calls written as text instead of through the function-
+        #    calling protocol. These do NOT execute — anything the model
+        #    claims to derive from them is fabricated.
+        text_calls = _detect_tool_calls_in_text(answer)
+        if text_calls:
+            from collections import Counter
+            counts = Counter(text_calls)
+            top = ", ".join(f"{n} (x{c})" if c > 1 else n
+                            for n, c in counts.most_common(5))
+            problems.append(
+                f"  - {len(text_calls)} tool-call JSON block(s) appear "
+                f"in the TEXT content of the answer ({top}). These did "
+                "NOT execute — tool calls must go through the function-"
+                "calling protocol, not be written as text. Any content "
+                "the answer derives from these is ungrounded.")
+
+        # 5. Backtick-quoted literals in the answer must appear in some
+        #    tool result. Otherwise the model fabricated a "direct quote".
+        problems.extend(_find_quoted_text_problems(answer, self.history))
+
+        # 6. Numeric counts ("47 ERROR") must match log_summary if the
+        #    model called it. Catches off-by-N counting from windowed
+        #    read_logs output instead of the exact whole-file census.
+        problems.extend(_find_numeric_claim_problems(answer, self.history))
+
+        # 7b. Coverage: every code investigated via code_lookup(code=X)
+        #     in this turn must appear in the ## Evidence section of the
+        #     Mode-C answer — not just name-dropped in a dismissive
+        #     "further investigation needed" tail. The investigation is
+        #     wasted if the synthesis doesn't reflect it.
+        if _is_mode_c(answer):
+            turn_start = getattr(self, "_current_turn_start", 0)
+            investigated: set[str] = set()
+            for h in self.history[turn_start:]:
+                if h.get("role") != "assistant":
+                    continue
+                for tc in h.get("tool_calls", []) or []:
+                    if tc.get("name") == "code_lookup":
+                        code = (tc.get("args") or {}).get("code", "")
+                        code = str(code).strip().upper()
+                        if code:
+                            investigated.add(code)
+            # Slice out the Evidence section (## Evidence … next ##).
+            ev_match = re.search(
+                r"##\s*Evidence\s*\n(.*?)(?:\n##|\Z)", answer, re.S | re.I)
+            evidence = ev_match.group(1) if ev_match else ""
+            missing_evidence = [c for c in sorted(investigated)
+                                 if c not in evidence]
+            if missing_evidence:
+                problems.append(
+                    f"  - {len(missing_evidence)} code(s) were "
+                    "investigated via code_lookup but do NOT appear in "
+                    "the ## Evidence section: "
+                    f"{', '.join(missing_evidence)}. Each investigated "
+                    "code needs its own Evidence bullet: a `file:line` "
+                    "from the log + what the manual passage says. Name-"
+                    "dropping them in a 'further investigation needed' "
+                    "sentence is NOT coverage. If multiple codes share "
+                    "one root cause, the Evidence section should list "
+                    "each code's bullet and then the Root Cause section "
+                    "can tie them together. Re-write to cover ALL "
+                    "investigated codes properly.")
+            # Even when codes ARE named in Evidence, each one should be
+            # backed EITHER by a manual reference OR by an explicit
+            # "manual has no entry" admission. Only check codes whose
+            # code_lookup actually surfaced a manual hit (i.e. it didn't
+            # come back NOT FOUND) — for those, the Evidence must
+            # include the manual citation, not just the log line.
+            elif investigated:
+                # Which codes had a real manual hit in their lookup?
+                codes_with_manual_hit: set[str] = set()
+                for h in self.history[turn_start:]:
+                    if (h.get("role") == "tool"
+                            and h.get("name") == "code_lookup"):
+                        result = h.get("result") or ""
+                        m_hdr = re.search(
+                            r"# code_lookup:\s*(\S+)",
+                            result.split("\n", 1)[0])
+                        if not m_hdr:
+                            continue
+                        c = m_hdr.group(1).strip().upper()
+                        if ("manual/" in result
+                                and "NOT FOUND" not in result.split(
+                                    "From manual", 1)[-1][:200]):
+                            codes_with_manual_hit.add(c)
+                missing_manual = [c for c in sorted(codes_with_manual_hit)
+                                   if c not in evidence
+                                   or "manual" not in
+                                   evidence.split(c, 1)[-1][:600].lower()]
+                # Coarser fallback: if NO manual ref at all but at least
+                # one code had a hit, flag it.
+                if codes_with_manual_hit and "manual" not in evidence.lower():
+                    problems.append(
+                        "  - Evidence cites log lines but contains NO "
+                        "manual reference, even though code_lookup "
+                        "returned a manual passage for "
+                        f"{', '.join(sorted(codes_with_manual_hit))}. "
+                        "Pair each log line with its manual passage "
+                        "(format: `manual/<file>` > <heading> — "
+                        "<snippet>). For any code whose code_lookup "
+                        "said 'From manual: NOT FOUND', the Evidence "
+                        "bullet should explicitly state 'manual has no "
+                        "entry for <code>'.")
+
+        # 7. Pending work in the plan. The plan is the live work-queue:
+        #    tools auto-add TODOs into it; the model adds tasks via
+        #    update_plan(add_tasks=...). A Mode-C final answer is only
+        #    allowed when every plan task is done or skipped — anything
+        #    pending or in_progress means the investigation is incomplete.
+        if _is_mode_c(answer):
+            turn_start = getattr(self, "_current_turn_start", 0)
+            plan = getattr(self.ctx, "plan", None)
+            pending_plan = []
+            if plan is not None:
+                pending_plan = [t for t in plan.tasks
+                                if t.status in ("pending", "in_progress")]
+            # Fallback for sessions without a plan: scan tool results
+            # directly so the check still fires even if the model never
+            # called create_plan.
+            pending_raw = _extract_pending_todos(self.history, turn_start)
+            if pending_plan:
+                preview = "; ".join(f"#{t.idx} {t.text}"
+                                     for t in pending_plan[:5])
+                more = (f" (+{len(pending_plan) - 5} more)"
+                        if len(pending_plan) > 5 else "")
+                problems.append(
+                    f"  - {len(pending_plan)} plan task(s) are not done "
+                    f"({preview}{more}). Every pending/in-progress task "
+                    "is required work before the final Mode-C answer. "
+                    "Execute the next pending task (or call "
+                    "update_plan(idx=N, status='skipped', result='<why>') "
+                    "if it turned out to be unnecessary). DO NOT emit a "
+                    "final answer while work remains.")
+            elif pending_raw:
+                preview = "; ".join(f"{t}({a})"
+                                     for t, a in pending_raw[:5])
+                more = (f" (+{len(pending_raw) - 5} more)"
+                        if len(pending_raw) > 5 else "")
+                problems.append(
+                    f"  - {len(pending_raw)} TODO item(s) from prior "
+                    f"tool outputs were NOT executed this turn ({preview}"
+                    f"{more}). Each `[N] <tool>(...)` line is a REQUIRED "
+                    "next step. Independent code prefixes are independent "
+                    "failures and must each be investigated. Call the "
+                    "missing tool(s) now, then re-emit the answer.")
         return problems
 
     def _maybe_verify_and_revise(self, answer: str, step: int,
                                   turn_start: int) -> str:
         cfg = self.ctx.cfg
+        # Stash turn_start so _find_problems can scope its TODO scan to
+        # this turn only (a prior turn's TODO list shouldn't gate this
+        # turn's answer).
+        self._current_turn_start = turn_start
         if not getattr(cfg, "verify_citations", True):
             return answer
 
         max_passes = max(1, int(getattr(cfg, "verify_max_passes", 3)))
-        tools = self.registry.schemas()
+        tools = self.registry.schemas(self.ctx.profile.name)
 
         for attempt in range(1, max_passes + 1):
             tools_used = _tools_used_in_turn(self.history, turn_start)
@@ -487,12 +1098,44 @@ class Agent:
             # passing tools=[] is the bug that produced the bad output:
             # the model was told to look something up and simultaneously
             # forbidden from doing it.
+            #
+            # For multi-code Mode-C investigations the persistent failure
+            # mode on small local models is FABRICATING the literal log
+            # line in the Evidence bullet. We pre-extract every real
+            # log-line+citation from the code_lookup results in this
+            # turn and paste them into the feedback as ready-to-use
+            # Markdown — the model just has to copy them, not recall.
+            evidence_paste = _extract_evidence_for_investigated_codes(
+                self.history, turn_start)
+            evidence_block = ""
+            if evidence_paste:
+                evidence_block = (
+                    "\n\nUSE THESE EXACT EVIDENCE BULLETS — copy them "
+                    "verbatim into the ## Evidence section (one bullet "
+                    "per investigated code, IN ORDER). Do NOT paraphrase "
+                    "and do NOT invent line numbers; the literal log "
+                    "line + line number for every code you investigated "
+                    "is already pulled below from the cached tool "
+                    "results:\n\n"
+                    + evidence_paste
+                    + "\n\nIf you reword any of these or invent a line "
+                    "number, verification will fail again.")
             feedback = (
                 f"Pre-answer verification FAILED (pass {attempt}/"
                 f"{max_passes}). Do NOT return the draft as-is. "
                 "Problems found:\n"
                 + "\n".join(problems)
+                + evidence_block
                 + "\n\nFix instructions:\n"
+                "  - NEVER write tool-call JSON like {\"name\": \"X\", "
+                "\"arguments\": {...}} in your TEXT reply — that does NOT "
+                "execute. To call a tool, use the function-calling "
+                "protocol (the client will marshal it). The text reply is "
+                "for the FINAL ANSWER ONLY.\n"
+                "  - Do NOT re-call a tool with the same arguments you "
+                "already used this turn — the result will not change. "
+                "If a previous result didn't help, change the args or "
+                "pick a different tool.\n"
                 "  - If you need manual content, CALL search_manual NOW "
                 "with the exact code or topic. Do NOT fabricate paths, "
                 "quotes, or section names. If search_manual returns no "
@@ -520,6 +1163,17 @@ class Agent:
                     + (" (tools available)" if attempt == 1 else "")
                     + "]\n\n")
             self.history.append({"role": "assistant", "text": answer})
+
+            # AUTO-EXECUTE missing tool TODOs before re-asking the model.
+            # Small models often fixate on codes they already investigated
+            # and keep re-calling those instead of the one that's missing.
+            # Run the missing calls ourselves and inject the results into
+            # history — then the synthesiser sees ALL the data it needs.
+            auto_executed = self._auto_execute_missing_todos(turn_start)
+            if auto_executed:
+                self.trace(f"  [auto-executed {len(auto_executed)} pending "
+                           f"TODO(s): {', '.join(auto_executed)}]")
+
             self.history.append({"role": "user", "text": feedback})
 
             # Re-ask with tools so the model can actually run search_manual
@@ -532,35 +1186,157 @@ class Agent:
                                         on_token=self.on_token)
             except TypeError:
                 resp = self.client.chat(self.system, self.history, tools)
+            self._accumulate_telemetry(resp)
+            self._turn_verification_passes = attempt + 1
 
             inner_steps = 0
+            inner_call_counts: dict[str, int] = {}
             while resp.wants_tools and inner_steps < 4:
                 self.history.append({"role": "assistant",
                                      "text": resp.text,
                                      "tool_calls": resp.tool_calls})
                 for tc in resp.tool_calls:
                     argstr = ", ".join(f"{k}={v!r}"
-                                       for k, v in tc["args"].items())
+                                       for k, v in (tc.get("args") or {}).items())
                     self.trace(f"  → {tc['name']}({argstr}) [revision]")
-                    result = self.registry.dispatch(
-                        tc["name"], tc["args"], self.ctx)
+                    result = self._dispatch_with_dedup(tc, inner_call_counts)
                     self.history.append({"role": "tool", "id": tc["id"],
                                          "name": tc["name"], "result": result})
+                    _sync_plan_from_tool(getattr(self.ctx, "plan", None),
+                                          tc, result)
                 inner_steps += 1
                 try:
                     resp = self.client.chat(self.system, self.history,
                                             tools, on_token=self.on_token)
                 except TypeError:
                     resp = self.client.chat(self.system, self.history, tools)
+                self._accumulate_telemetry(resp)
 
+            # If the inner loop burned its budget on tool calls and the
+            # model never produced text, force ONE final tools=[] call so
+            # it MUST synthesise rather than spinning. This is the
+            # difference between "empty revision" (the prior failure
+            # mode) and getting any answer at all.
             revised = (resp.text or "").strip()
             if not revised:
-                # Empty revision — keep the prior answer, let next pass try
-                # again (or fall through to the disclaimer branch).
+                self.trace("  [verification: inner loop ended without "
+                           "text — forcing synthesis with tools disabled]")
+                self.history.append({
+                    "role": "user",
+                    "text": ("You have called enough tools. The data is "
+                             "in history above. Now WRITE THE ANSWER. "
+                             "Emit the four-section Mode-C template "
+                             "(## Root Cause / ## Evidence / ## Fix / "
+                             "## Suggestions to Improve). One Evidence "
+                             "bullet per investigated code. Do NOT call "
+                             "any more tools.")})
+                try:
+                    resp = self.client.chat(self.system, self.history, [],
+                                            on_token=self.on_token)
+                except TypeError:
+                    resp = self.client.chat(self.system, self.history, [])
+                self._accumulate_telemetry(resp)
+                revised = (resp.text or "").strip()
+            if not revised:
+                # Truly empty — let the next pass try (or fall through).
                 self.trace("  [verification: empty revision]")
                 continue
             answer = revised
         return answer
+
+    def _auto_execute_missing_todos(self, turn_start: int) -> list[str]:
+        """Run any `[N] tool(args)` TODO line that's emitted by a prior
+        tool result this turn but hasn't been executed yet. Returns the
+        list of human-readable call signatures that were executed.
+
+        This is the safety net for small models that read a TODO list,
+        say "yes I will investigate X next", then re-call codes they
+        already had. We just do it for them.
+        """
+        pending = _extract_pending_todos(self.history, turn_start)
+        if not pending:
+            return []
+        executed: list[str] = []
+        # Mirror the agent loop's plan-sync and dispatch path so the
+        # plan tasks get marked done and the tool results land in
+        # history exactly as if the model had called them.
+        for i, (tool, args_str) in enumerate(pending):
+            # Parse the args back into a dict. Accept the simple
+            # `k=v[,k=v]` form the TODO emitter uses.
+            args: dict = {}
+            for pair in args_str.split(","):
+                pair = pair.strip()
+                if "=" not in pair:
+                    continue
+                k, _, v = pair.partition("=")
+                v = v.strip().strip("'\"")
+                args[k.strip()] = v
+            tc = {"id": f"auto-{i}", "name": tool, "args": args}
+            # Synthetic assistant turn so the plan sync can mark the
+            # pending task done by argument match.
+            self.history.append({"role": "assistant", "text": "",
+                                  "tool_calls": [tc]})
+            self.trace(f"  → {tool}({args_str}) [auto-executed]")
+            result = self.registry.dispatch(tool, args, self.ctx)
+            self.history.append({"role": "tool", "id": tc["id"],
+                                  "name": tool, "result": result})
+            _sync_plan_from_tool(getattr(self.ctx, "plan", None),
+                                  tc, result)
+            executed.append(f"{tool}({args_str})")
+        return executed
+
+    def _persist_turn(self, question: str, answer: str, steps: int,
+                       turn_start: int) -> None:
+        """Append an audit record and (when enabled) save the session."""
+        cfg = self.ctx.cfg
+        try:
+            from . import session as _session   # local: avoid import cycle
+            transcript_since_turn = self.history[turn_start:]
+            telemetry = {
+                "tokens_in": getattr(self, "_turn_tokens_in", 0),
+                "tokens_out": getattr(self, "_turn_tokens_out", 0),
+                "latency_ms": getattr(self, "_turn_latency_ms", 0),
+                "llm_calls": getattr(self, "_turn_llm_calls", 0),
+                "verification_passes":
+                    getattr(self, "_turn_verification_passes", 1),
+            }
+            if getattr(cfg, "audit_enabled", True):
+                _session.write_audit(
+                    cfg.project_root, session_id=self.session_id,
+                    question=question, answer=answer, steps=steps,
+                    transcript=transcript_since_turn,
+                    telemetry=telemetry)
+            if getattr(cfg, "session_persist", False):
+                _session.save_session(cfg.project_root, self)
+        except Exception:                       # noqa: BLE001
+            # Persistence is best-effort. A broken audit path must not
+            # take down the agent loop.
+            pass
+
+    def _dispatch_with_dedup(self, tc: dict,
+                              call_counts: dict) -> str:
+        """Dispatch a tool call but refuse if the same (name, args) was
+        already called too many times in this turn. Catches loops where the
+        model keeps re-calling the same tool expecting a different result."""
+        sig = _tool_call_signature(tc["name"], tc.get("args") or {})
+        call_counts[sig] = call_counts.get(sig, 0) + 1
+        cap = max(1, int(getattr(self.ctx.cfg,
+                                  "max_repeated_tool_call", 2)))
+        if call_counts[sig] > cap:
+            return (f"REFUSED: {tc['name']} with these exact arguments has "
+                    f"already been called {call_counts[sig] - 1} time(s) in "
+                    "this turn. The result will not change. Pick a "
+                    "different tool, change the arguments, or emit your "
+                    "final answer now.")
+        return self.registry.dispatch(tc["name"], tc.get("args") or {},
+                                       self.ctx)
+
+    def _accumulate_telemetry(self, resp: Assistant) -> None:
+        """Sum LLM-call telemetry across a single ask() turn."""
+        self._turn_tokens_in += resp.tokens_in or 0
+        self._turn_tokens_out += resp.tokens_out or 0
+        self._turn_latency_ms += resp.latency_ms or 0
+        self._turn_llm_calls += 1
 
     # ----- main loop -----
     def ask(self, question: str) -> AgentResult:
@@ -572,7 +1348,16 @@ class Agent:
             plan.reset()
         self.history.append({"role": "user", "text": question})
         turn_start = len(self.history)   # for tracking tool calls in this turn
-        tools = self.registry.schemas()
+        call_counts: dict[str, int] = {}  # (name, args) signature -> count
+        # Telemetry accumulators for this turn.
+        self._turn_tokens_in = 0
+        self._turn_tokens_out = 0
+        self._turn_latency_ms = 0
+        self._turn_llm_calls = 0
+        self._turn_verification_passes = 1
+        # Filter tool schemas by the active profile so domain-specific tools
+        # (e.g. EDA stage_timeline) don't appear in generic-mode sessions.
+        tools = self.registry.schemas(self.ctx.profile.name)
 
         for step in range(1, self.max_steps + 1):
             last = step == self.max_steps
@@ -587,21 +1372,38 @@ class Agent:
             except TypeError:
                 resp = self.client.chat(
                     self.system, self.history, [] if last else tools)
+            self._accumulate_telemetry(resp)
 
             if not resp.wants_tools or last:
                 answer = resp.text.strip() or "(no answer produced)"
                 answer = self._maybe_verify_and_revise(answer, step, turn_start)
                 self.history.append({"role": "assistant", "text": answer})
-                return AgentResult(answer, step, list(self.history))
+                # Audit + persist on every completed turn. Best-effort —
+                # never let an IO error in the audit path crash the loop.
+                self._persist_turn(question, answer, step, turn_start)
+                return AgentResult(
+                    answer=answer, steps=step,
+                    transcript=list(self.history),
+                    tokens_in=self._turn_tokens_in,
+                    tokens_out=self._turn_tokens_out,
+                    latency_ms=self._turn_latency_ms,
+                    llm_calls=self._turn_llm_calls,
+                    verification_passes=self._turn_verification_passes,
+                )
 
             self.history.append({"role": "assistant", "text": resp.text,
                                   "tool_calls": resp.tool_calls})
             for tc in resp.tool_calls:
-                argstr = ", ".join(f"{k}={v!r}" for k, v in tc["args"].items())
+                argstr = ", ".join(f"{k}={v!r}"
+                                    for k, v in (tc.get("args") or {}).items())
                 self.trace(f"  → {tc['name']}({argstr})")
-                result = self.registry.dispatch(tc["name"], tc["args"], self.ctx)
+                result = self._dispatch_with_dedup(tc, call_counts)
                 self.history.append({"role": "tool", "id": tc["id"],
                                      "name": tc["name"], "result": result})
+                # Auto-sync the plan: mark this call done if it was a
+                # pending task, and append any new TODOs the tool emitted.
+                _sync_plan_from_tool(getattr(self.ctx, "plan", None),
+                                      tc, result)
 
         # Unreachable: the last-step branch always returns.
         return AgentResult("(loop exhausted)", self.max_steps, list(self.history))

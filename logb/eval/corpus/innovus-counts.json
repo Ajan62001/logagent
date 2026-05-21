@@ -1,0 +1,15 @@
+{
+  "id": "innovus-counts",
+  "log_path": "logs/sample_innovus.log",
+  "question": "how many errors and fatals are in this log?",
+  "mode": "eda",
+  "expected_facts": [
+    "4 ERROR",
+    "2 FATAL"
+  ],
+  "forbidden_facts": [
+    "47 ERROR",
+    "## Root Cause"
+  ],
+  "max_steps": 4
+}

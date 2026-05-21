@@ -34,6 +34,16 @@ class Profile:
     stage_rx: object                     # re.Pattern[bytes] | None
     detect_signatures: tuple             # (re.Pattern[bytes], ...) — auto-detect
     prompt_extras: str                   # appended to the base system prompt
+    # Timestamp extraction: a bytes regex whose first capture group, when
+    # passed through `timestamp_to_seconds` below, yields a comparable
+    # int/float "moment in time" for the line. Used by the time-aware
+    # index to support correlate() across multiple logs. None disables
+    # timestamp indexing for this profile.
+    timestamp_rx: object = None          # re.Pattern[bytes] | None
+    # Map captured bytes -> seconds-since-some-epoch (any monotonic int
+    # works; the comparison is profile-internal). Default reads the
+    # capture as a decimal integer (EDA's `[HH:MM:SS  Ns]` 's `N`).
+    timestamp_to_seconds: object = None  # callable(bytes) -> int | None
 
 
 # --------------------------------------------------------------------------- #
@@ -50,6 +60,13 @@ _EDA_SEV_B = {
     "warn":  re.compile(rb"\b(WARN(ING)?|\*\*WARN)\b", re.I),
 }
 
+def _eda_ts(captured: bytes) -> int | None:
+    try:
+        return int(captured)
+    except (TypeError, ValueError):
+        return None
+
+
 EDA = Profile(
     name="eda",
     log_extensions=frozenset({".log", ".rpt", ".txt", ".out", ""}),
@@ -57,6 +74,8 @@ EDA = Profile(
     severity_bytes=_EDA_SEV_B,
     code_rx=re.compile(rb"\(([A-Z][A-Z0-9]+-\d+)\)"),
     stage_rx=re.compile(rb'--- (Starting|Ending) "'),
+    timestamp_rx=re.compile(rb"\[\d{2}:\d{2}:\d{2}\s+(\d+)s\]"),
+    timestamp_to_seconds=_eda_ts,
     detect_signatures=(
         re.compile(rb'--- (Starting|Ending) "'),
         re.compile(rb"\([A-Z][A-Z0-9]+-\d+\)"),
@@ -68,9 +87,28 @@ EDA = Profile(
         "- Stage banners look like `--- Starting \"<stage>\" ---` and "
         "`--- Ending \"<stage>\" ---`.\n"
         "- Message codes look like `(IMPLF-213)`, `(IMPCORE-9001)`, "
-        "`(TECHLIB-1321)`. Search the manual by the exact code.\n"
+        "`(TECHLIB-1321)`.\n"
+        "- MANUAL LOOKUP RULE (important): the indexed manual is the "
+        "Innovus User Guide, NOT the Messages Reference. Searching the "
+        "manual by the bare code (e.g. `search_manual('IMPLF-213')`) "
+        "returns BM25 NOISE — high scores against irrelevant sections. "
+        "The right pattern is: (1) `read_logs(pattern='IMPLF-213')` to "
+        "get the literal message TEXT, then (2) `search_manual` using "
+        "the plain-English words from that message (e.g. 'MASK attribute "
+        "ignored', 'macro references undefined site'). If a search_manual "
+        "result begins with '⚠ HEURISTIC WARNING', do NOT quote it — "
+        "follow its instruction and re-search by message text. If even "
+        "the text-based search returns no relevant hit, say so honestly: "
+        "'manual has no entry for this' — do NOT fabricate an "
+        "explanation.\n"
         "- Cascade rule: when ERRORs exist, the FIRST one is the prime "
-        "suspect; later ones are usually downstream symptoms.\n"
+        "suspect; later ones are usually downstream symptoms. The cascade "
+        "rule applies WITHIN one code-prefix family (e.g. IMPLF-40 and "
+        "IMPLF-213 are likely linked). If log_summary returns >=2 distinct "
+        "prefixes (e.g. IMPLF vs. TECHLIB vs. IMPCTS), treat them as "
+        "INDEPENDENT failures and call search_manual once per prefix — do "
+        "not collapse them into one root cause until the manual lookups "
+        "confirm they are linked.\n"
         "- Example Mode A: Q: \"how many errors?\" → A: \"47 ERROR, 2 FATAL, "
         "310 WARN (log_summary, exact whole-file).\"\n"
         "- Example Mode B: Q: \"what does IMPCTS-5012 mean?\" → A: a 1-2 "
@@ -107,12 +145,52 @@ _GEN_SEV_B = {
         rb"\b(WARN(ING)?)\b|\[WARN(ING)?\]|\bW\d{4}\b|^<4>", re.I | re.M),
 }
 
+def _generic_ts(captured: bytes) -> int | None:
+    """Try a few common formats — ISO 8601 / klog / nginx-style timestamps.
+    Returns an int the index can sort by; the absolute reference doesn't
+    matter as long as ordering within a log is consistent."""
+    import datetime as _dt
+    s = captured.decode("ascii", "replace").strip()
+    if not s:
+        return None
+    # Pure integer seconds (e.g. captured from a wallclock-suffix format).
+    if s.isdigit():
+        try:
+            return int(s)
+        except ValueError:
+            return None
+    # ISO 8601: 2024-05-20T14:23:01[.fff][Z|±HH:MM]
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+        # klog: MMDD HH:MM:SS.uuuuuu — assume current year
+        "%m%d %H:%M:%S.%f",
+    ):
+        try:
+            cleaned = s.rstrip("Z").split("+")[0].split("-08:")[0]  # crude TZ strip
+            dt = _dt.datetime.strptime(cleaned, fmt)
+            return int(dt.timestamp())
+        except ValueError:
+            continue
+    return None
+
+
 GENERIC = Profile(
     name="generic",
     log_extensions=frozenset({".log", ".txt", ".out", ".err",
                               ".json", ".jsonl", ".ndjson", ""}),
     severity=_GEN_SEV,
     severity_bytes=_GEN_SEV_B,
+    # Several common shapes captured in one alternation. The first capture
+    # group is whatever matched; _generic_ts tries to parse all the formats
+    # it might be.
+    timestamp_rx=re.compile(
+        rb"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?)"
+        rb"|^([EWIF]\d{4}\s+\d{2}:\d{2}:\d{2}\.\d+)"
+        rb"|^(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})"),
+    timestamp_to_seconds=_generic_ts,
     # Catch any reasonable "code"-ish token so log_summary's distinct-code
     # table is populated for EDA logs, build logs, k8s logs, syslog, etc.
     # The alternation order matters: most-specific (paren/bracket-wrapped

@@ -1,0 +1,16 @@
+{
+  "id": "innovus-code-explain",
+  "log_path": "logs/sample_innovus.log",
+  "question": "what does IMPSDC-3071 mean? answer from the manual.",
+  "mode": "eda",
+  "expected_facts": [
+    "IMPSDC-3071",
+    {"any_of": ["clock", "constraint", "create_clock"]}
+  ],
+  "forbidden_facts": [
+    "## Root Cause",
+    "## Fix",
+    "## Suggestions to Improve"
+  ],
+  "max_steps": 4
+}

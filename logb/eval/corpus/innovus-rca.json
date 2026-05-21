@@ -1,0 +1,20 @@
+{
+  "id": "innovus-rca",
+  "log_path": "logs/sample_innovus.log",
+  "question": "why did the run crash? give a root cause.",
+  "mode": "eda",
+  "expected_facts": [
+    "IMPSDC-3071",
+    "core_clk",
+    "top.sdc",
+    {"any_of": ["before it is created", "before create_clock", "referenced before"]},
+    "## Root Cause"
+  ],
+  "forbidden_facts": [
+    "IMPIMEX-4022",
+    "TECHLIB-1366",
+    "techlib/impex/impex_4022",
+    "scripts/cts.tcl:26"
+  ],
+  "max_steps": 8
+}

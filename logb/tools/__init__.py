@@ -4,12 +4,18 @@ from __future__ import annotations
 
 from .ask import ASK_USER
 from .base import Tool, ToolContext, ToolRegistry, truncate
+from .correlate import CORRELATE
+from .delegate import DELEGATE_SUBTASK
+from .eda import CODE_LOOKUP, SDC_LINT, STAGE_ERRORS, STAGE_TIMELINE
 from .files import READ_FILE
+from .incident import INCIDENT_AROUND
 from .logs import LIST_LOGS, READ_LOGS
 from .manual import SEARCH_MANUAL
+from .mentions import FIND_MENTIONS
 from .notes import DELETE_NOTE, GET_NOTE, LIST_NOTES, SAVE_NOTE
 from .plan import CREATE_PLAN, SHOW_PLAN, UPDATE_PLAN
 from .profile import DETECT_PROFILE
+from .region_summary import REGION_SUMMARY
 from .shell import RUN_BASH
 from .skills import LIST_SKILLS, RUN_SKILL
 from .summary import LOG_SUMMARY
@@ -18,11 +24,19 @@ ALL_TOOLS = [
     CREATE_PLAN, UPDATE_PLAN, SHOW_PLAN,           # plan first, then act
     LIST_LOGS, READ_LOGS,                          # look in the logs
     LOG_SUMMARY,                                   # exact counts + distinct-code table
+    REGION_SUMMARY,                                # paragraph summary of any line window
+    CORRELATE,                                     # interleave logs by timestamp
+    INCIDENT_AROUND,                               # fetch a multi-line incident as a unit
+    FIND_MENTIONS,                                 # inverted index of file paths / identifiers
     DETECT_PROFILE,                                # confirm which domain this log belongs to
     SEARCH_MANUAL,                                 # refer to the manual
     LIST_SKILLS, RUN_SKILL,                        # refer to skills
     READ_FILE,                                     # files mentioned in logs
     SAVE_NOTE, GET_NOTE, LIST_NOTES, DELETE_NOTE,  # durable cross-question memory
+    DELEGATE_SUBTASK,                              # spawn a focused sub-agent
+    STAGE_TIMELINE, STAGE_ERRORS,                  # EDA pipeline view
+    SDC_LINT,                                      # EDA SDC static check
+    CODE_LOOKUP,                                   # EDA combined log+manual lookup
     RUN_BASH,                                      # propose+run a shell command (approval-gated)
     ASK_USER,                                      # clarifying questions
 ]

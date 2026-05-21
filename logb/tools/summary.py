@@ -36,12 +36,16 @@ def _log_summary(args: dict, ctx: ToolContext) -> str:
     rows = [c for c in codes if c[1] in wanted]
     rows.sort(key=lambda c: (_RANK.get(c[1], 9), -c[2], c[0]))
 
-    # One example line per code, via a direct seek (bounded by #codes shown).
-    shown = rows[:300]
+    # One example line per code, via a direct seek to the offset stored
+    # in the index. Each seek is microseconds, so we read examples for
+    # ALL rows — no display cap. The final truncate() (driven by
+    # cfg.tool_result_char_budget) is the only ceiling on output size,
+    # which keeps the model's context bounded without us pre-clipping
+    # rows the user explicitly asked to see.
     examples: dict[int, str] = {}
-    if shown:
+    if rows:
         with open(f, "rb") as fh:
-            for _code, _sev, _n, _ln, off in shown:
+            for _code, _sev, _n, _ln, off in rows:
                 fh.seek(off)
                 examples[off] = fh.readline().decode(
                     "utf-8", "replace").rstrip("\n")
@@ -54,13 +58,47 @@ def _log_summary(args: dict, ctx: ToolContext) -> str:
         return head + "(no FATAL/ERROR/WARN message codes matched)"
 
     lines = [f"{'CODE':<16} {'SEV':<5} {'COUNT':>7}  FIRST   EXAMPLE"]
-    for code, sev, n, ln, off in shown:
+    for code, sev, n, ln, off in rows:
         ex = examples.get(off, "").strip()[:110]
         lines.append(f"{code:<16} {sev:<5} {n:>7}  L{ln + 1:<6} {ex}")
-    if len(rows) > len(shown):
-        lines.append(f"... (+{len(rows) - len(shown)} more codes; "
-                      f"use severity= to narrow)")
-    return truncate(head + "\n".join(lines), ctx.cfg.tool_result_char_budget)
+
+    # NEXT-STEPS NUDGE: small local models stop after one search_manual.
+    # Enumerate every distinct error/fatal code as an explicit TODO list so
+    # the next iteration of the agent loop has a concrete remaining
+    # checklist instead of an open-ended "what now". One code per line,
+    # grouped by prefix (cascade rule applies within a prefix family).
+    severe = [c for c in rows if c[1] in ("fatal", "error")]
+    todo = ""
+    if severe:
+        # Group by prefix (everything before the last '-NNN'). Within a
+        # prefix, only the first code needs investigation (cascade rule);
+        # across prefixes, each one is independent.
+        by_prefix: dict[str, list] = {}
+        for code, sev, n, ln, off in severe:
+            pfx = code.rsplit("-", 1)[0]
+            by_prefix.setdefault(pfx, []).append((code, sev, n, ln))
+        todo_lines = [
+            "",
+            "TODO — investigate each distinct prefix below as a SEPARATE "
+            "failure (cascade rule applies WITHIN a prefix, not across):"]
+        for i, (pfx, items) in enumerate(by_prefix.items(), 1):
+            primary = items[0]   # first code in the prefix family
+            code, sev, n, ln = primary
+            rest = (f" [+{len(items) - 1} more in {pfx}-* family: "
+                    f"{', '.join(c[0] for c in items[1:])}]"
+                    if len(items) > 1 else "")
+            todo_lines.append(
+                f"  [{i}] code_lookup(code={code!r})   "
+                f"# {sev.upper()}, {n} occurrence(s), first @ L{ln + 1}{rest}")
+        todo_lines.append(
+            "  Do EVERY [N] above before emitting a final answer. "
+            "code_lookup auto-derives the right manual query from the log "
+            "line, so you do NOT need to chain read_logs + search_manual "
+            "manually. If a [N] returns no manual hit, say so honestly — "
+            "do NOT fabricate.")
+        todo = "\n" + "\n".join(todo_lines)
+    return truncate(head + "\n".join(lines) + todo,
+                    ctx.cfg.tool_result_char_budget)
 
 
 LOG_SUMMARY = Tool(
