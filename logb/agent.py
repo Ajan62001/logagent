@@ -1391,19 +1391,41 @@ class Agent:
                     verification_passes=self._turn_verification_passes,
                 )
 
+            # Cap parallel tool calls in one response (strict mode sets
+            # this to 1). Small models that emit 5 dispatches don't read
+            # the intermediate results — forcing serial calls means each
+            # subsequent call is informed by the previous result.
+            tool_calls = resp.tool_calls
+            cap = int(getattr(self.ctx.cfg,
+                              "max_tool_calls_per_response", 0) or 0)
+            dropped = 0
+            if cap > 0 and len(tool_calls) > cap:
+                dropped = len(tool_calls) - cap
+                tool_calls = tool_calls[:cap]
+                self.trace(f"  [strict: capped {dropped} parallel tool "
+                           f"call(s); kept first {cap}]")
             self.history.append({"role": "assistant", "text": resp.text,
-                                  "tool_calls": resp.tool_calls})
-            for tc in resp.tool_calls:
+                                  "tool_calls": tool_calls})
+            for tc in tool_calls:
                 argstr = ", ".join(f"{k}={v!r}"
                                     for k, v in (tc.get("args") or {}).items())
                 self.trace(f"  → {tc['name']}({argstr})")
                 result = self._dispatch_with_dedup(tc, call_counts)
                 self.history.append({"role": "tool", "id": tc["id"],
                                      "name": tc["name"], "result": result})
-                # Auto-sync the plan: mark this call done if it was a
-                # pending task, and append any new TODOs the tool emitted.
                 _sync_plan_from_tool(getattr(self.ctx, "plan", None),
                                       tc, result)
+            # Proactive auto-execute (strict mode): after the model's
+            # explicit calls land, also run any pending `[N] tool(args)`
+            # TODOs from prior tool results that the model hasn't
+            # touched. This breaks the "weak model fixates on first
+            # code, ignores TECHLIB-1366" loop without waiting for
+            # verification to catch it.
+            if getattr(self.ctx.cfg, "auto_execute_todos", False):
+                auto = self._auto_execute_missing_todos(turn_start)
+                if auto:
+                    self.trace(f"  [strict: auto-executed "
+                               f"{len(auto)} pending TODO(s)]")
 
         # Unreachable: the last-step branch always returns.
         return AgentResult("(loop exhausted)", self.max_steps, list(self.history))

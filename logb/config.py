@@ -71,6 +71,15 @@ class Config:
 
     # --- loop hygiene ---
     max_repeated_tool_call: int = 2 # refuse the same tool+args after this many calls/turn
+    # 0 = no cap. Strict mode forces 1 so the model can't emit a
+    # ten-way parallel dispatch in one response (small models that do
+    # this usually intended sequential calls but never look at the
+    # intermediate results).
+    max_tool_calls_per_response: int = 0
+    # When True, after every tool dispatch the agent loop ALSO runs
+    # any pending `[N] tool(args)` TODOs emitted by the result. Strict
+    # mode turns this on so weak models can't "forget" their TODO list.
+    auto_execute_todos: bool = False
 
     # --- session persistence + audit trail ---
     session_persist: bool = False   # save history to .logb-sessions/<id>.json each turn
@@ -117,31 +126,45 @@ class Config:
 
     def apply_strict(self) -> "Config":
         """Tune for 7B-class models. The 7B failure surface is well-known
-        (tool-call spam in text, duplicate-call loops, manual confabulation,
-        going round in circles past max_steps). Strict mode flips the
-        existing knobs to fail fast and verify hard. Idempotent."""
+        (tool-call spam in text, duplicate-call loops, manual
+        confabulation, fixating on the first code investigated, parallel
+        tool calls they don't actually read between, looping past
+        max_steps). Strict mode flips the existing knobs to fail fast,
+        verify hard, and AUTO-EXECUTE the work the model keeps
+        forgetting. Idempotent."""
         self.strict = True
         # Fail fast: the longer a small model spins, the more bad output
         # it accumulates. Better to give up after a tight budget and let
         # the verifier surface "could not verify" than to keep dithering.
         if self.max_steps > 6:
             self.max_steps = 6
-        # Verify hard: small models often need 2-3 revision attempts to
-        # produce a clean answer.
+        # Verify hard: small models often need 2-3 revision attempts.
         if self.verify_max_passes < 5:
             self.verify_max_passes = 5
         # Zero tolerance for re-calls: the small-model duplicate-call
-        # failure mode is dramatic enough to refuse on the second attempt
-        # rather than the third.
+        # failure mode is dramatic enough to refuse on the second
+        # attempt rather than the third.
         self.max_repeated_tool_call = 1
-        # Smaller per-tool budgets so a wrong-tool call doesn't dominate
-        # the context window with junk.
+        # Per-tool char budget tight so a wrong tool can't bloat ctx.
         if self.tool_result_char_budget > 4000:
             self.tool_result_char_budget = 4000
-        # Eager-compact: keep the working window tight so the model has
-        # less stale context to hallucinate against.
-        self.history_compact_keep_recent = 2
-        self.history_compact_budget = 240
+        # CRUCIAL change from earlier strict mode: keep MORE recent tool
+        # results in full, not fewer. Synthesis (writing the Evidence
+        # section) requires the literal log lines + manual passages to
+        # be in-context; weak models cannot reconstruct them from
+        # compacted head+tail stubs. Older results still get compacted
+        # to a small budget.
+        if self.history_compact_keep_recent < 10:
+            self.history_compact_keep_recent = 10
+        self.history_compact_budget = 200
+        # Force serial tool calls. A small model that emits 5
+        # code_lookup calls in a single response is NOT reading the
+        # results between them — by the time the next LLM call happens
+        # all 5 have already been dispatched. Capping to 1 forces a
+        # read-then-decide loop the model can actually follow.
+        self.max_tool_calls_per_response = 1
+        # Don't rely on the model to follow TODOs: just run them.
+        self.auto_execute_todos = True
         return self
 
     def allowed_roots(self) -> list[Path]:

@@ -2669,7 +2669,14 @@ def test_strict_mode_tightens_knobs():
     assert cfg.verify_max_passes == 5
     assert cfg.max_repeated_tool_call == 1
     assert cfg.tool_result_char_budget <= 4000
-    assert cfg.history_compact_keep_recent == 2
+    # Strict mode now keeps MORE recent tool results in full (not fewer)
+    # because synthesis needs the literal log lines + manual passages in
+    # context. Older results still get aggressively compacted.
+    assert cfg.history_compact_keep_recent >= 10
+    # Strict mode also forces serial tool calls and proactive
+    # auto-execution of pending TODOs.
+    assert cfg.max_tool_calls_per_response == 1
+    assert cfg.auto_execute_todos is True
 
 
 def test_strict_mode_idempotent():

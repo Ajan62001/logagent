@@ -349,9 +349,13 @@ def _cmd_doctor(cfg: Config, _args) -> int:
     profile = _resolve_profile_for_cfg(cfg)
     print(f"mode              : {cfg.mode}  -> profile {profile.name!r}")
     if cfg.strict:
-        print(f"strict mode       : ON  (max_steps={cfg.max_steps}, "
+        print(f"strict mode       : ON  "
+              f"(max_steps={cfg.max_steps}, "
               f"verify_max_passes={cfg.verify_max_passes}, "
-              f"max_repeated_tool_call={cfg.max_repeated_tool_call})")
+              f"max_repeated_tool_call={cfg.max_repeated_tool_call}, "
+              f"max_tool_calls_per_response={cfg.max_tool_calls_per_response}, "
+              f"auto_execute_todos={cfg.auto_execute_todos}, "
+              f"history_compact_keep_recent={cfg.history_compact_keep_recent})")
     print(f"backend           : {cfg.backend}")
     if cfg.backend == "ollama":
         import json
@@ -417,9 +421,12 @@ def build_parser() -> argparse.ArgumentParser:
                    action="store_false", default=None,
                    help="don't append per-answer records to .logb-audit.jsonl")
     p.add_argument("--strict", action="store_true", default=None,
-                   help="tune the harness for 7B-class local models (lower "
+                   help="tune the harness for 7B-class local models: lower "
                    "step budget, more verification passes, zero-tolerance "
-                   "duplicate-call brake, tighter tool budgets)")
+                   "duplicate-call brake, serial tool calls only "
+                   "(no parallel dispatch), proactive auto-execution of "
+                   "pending TODOs so the model can't 'forget' codes, and "
+                   "a wider keep_recent window so synthesis has the data.")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="trace tool calls")
 
